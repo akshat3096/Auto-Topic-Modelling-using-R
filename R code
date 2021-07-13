@@ -1,0 +1,221 @@
+rm(list = ls()) #clear the variables (just in case)
+
+#load the library
+library(tm)
+library(slam)
+library(topicmodels)
+library(officer)
+library(ldatuning)
+library(rjson)
+library(pdftools)
+library(textreadr)
+library(snow)
+library(parallel)
+library(stringr)
+library(stringi)
+library(dplyr)
+library(knitr)
+library(qdapTools)
+library(textstem)
+
+
+setwd("~/Internal/Digital/sample2.0")
+target_directory <- "D:/Users/Digital/sample2.0"
+
+
+#load files into corpus
+#get listing of .txt files in directory
+filenames_txt <- list.files(target_directory,pattern='*.txt')
+head(filenames_txt)
+
+#get a list of .docx files in the directory
+filenames_doc <- list.files(target_directory,pattern='*.docx')
+head(filenames_doc)
+
+#get a list of .pdf files in the directory
+filenames_pdf <- list.files(target_directory,pattern='*.pdf$')
+head(filenames_pdf)
+
+#read files into a character vector
+data_txt <- lapply(filenames_txt,readLines)
+data_doc <- lapply(filenames_doc,read_docx)
+data_pdf <- lapply(filenames_pdf,pdf_text)
+
+data1 <- list2df(data_txt,col1 = "Content",col2 = "Doc_num")
+data1 <- data1 %>% 
+  group_by(Doc_num) %>% 
+  summarise(content =paste(unlist(Content),collapse = " "))
+data1 <- as.data.frame(data1)
+
+data2 <- list2df(data_doc,col1 = "Content",col2 = "Doc_num")
+data2 <- data2 %>% 
+  group_by(Doc_num) %>% 
+  summarise(content =paste(unlist(Content),collapse = " "))
+data2 <- as.data.frame(data2)
+
+data3 <- list2df(data_pdf,col1 = "Content",col2="Doc_num")
+data3 <- data3 %>% 
+  group_by(Doc_num) %>% 
+  summarise(content =paste(unlist(Content),collapse = " "))
+data3 <- as.data.frame(data3)
+
+df <- as.data.frame(rbind(data1,data2))
+final_df <- as.data.frame(rbind(df,data3))
+
+
+#define all stopwords
+genericStopwords <- c(
+  stopwords("english"),
+  stopwords("SMART")
+)
+genericStopwords <- gsub("'", "", genericStopwords)  #remove apostrophes
+genericStopwords <- unique(genericStopwords)
+#genericStopwords <- stemDocument(genericStopwords, language = "porter")
+
+#Set parameters for Gibbs sampling for LDA
+nstart <- 5
+seed <-
+  list(5,
+       46225,
+       500,
+       6300,
+       190000)
+best <- TRUE
+burnin <- 5000
+iter <- 10000
+thin <- 10000
+keep <- 100
+
+#Range of topic numbers to search for optimum number
+sequ <-
+  seq(2,10,1) 
+
+#pre-processing:
+data <- tolower(final_df$content)  #force to lowercase
+data[stri_count(data, regex="\\S+") < 8] = ""
+data <- gsub("'", "", data)  #remove apostrophes
+data <-
+  gsub("[[:punct:]]", " ", data)  #replace punctuation with space
+data <-
+  gsub("[[:cntrl:]]", " ", data)  #replace control characters with space
+data <-
+  gsub("[[:digit:]]", "", data)  #remove digits
+data <-
+  gsub("^[[:space:]]+", "", data) #remove whitespace at beginning of documents
+data <-
+  gsub("[[:space:]]+$", "", data) #remove whitespace at end of documents
+data <- stripWhitespace(data)
+
+#lemmatize the documents
+data_doc1 <- lemmatize_strings(data)
+data_doc1 <- stem_strings(data)
+
+#load files into corpus
+#create corpus from vector
+data_docs <- Corpus(VectorSource(data_doc1))
+
+#Removal of stopwords
+data_docs <- tm_map(data_docs, removeWords, genericStopwords)
+
+#Create document-term matrix
+dtm <- DocumentTermMatrix(data_docs)
+#remove terms that occur in less than 1% of the documents
+ind <- col_sums(dtm) < length(data) * 0.01
+dtm <- dtm[,!ind]
+#remove documents with no terms
+ind <- row_sums(dtm) == 0
+dtm <- dtm[!ind,]
+data_docs <- data_docs[!ind]
+#collapse matrix by summing over columns
+freq <- col_sums(dtm)
+#create sort order (descending)
+freq <- freq[order(freq, decreasing = TRUE)]
+#List all terms in decreasing order of freq
+term_count_table <-
+  data.frame(
+    Term = names(freq),
+    Count = unname(freq)
+  )
+kable(term_count_table[1:25,]) #show first 25 rows
+
+
+##Calculate the number of cores
+no_cores <- detectCores() - 1
+result <- FindTopicsNumber(
+  dtm,
+  topics = sequ,
+  metrics = c("CaoJuan2009", "Griffiths2004","Arun2010"),
+  method = "Gibbs",
+  control = list(
+    nstart = nstart,
+    seed = seed,
+    best = best,
+    burnin = burnin,
+    iter = iter,
+    keep = keep,
+    thin = thin
+  ),
+  mc.cores = no_cores,
+  verbose = TRUE
+)
+
+FindTopicsNumber_plot(result)
+
+topic_num <-
+  result$topics[min(which.min(result$CaoJuan2009),
+                    which.min(result$Arun2010),
+                    which.max(result$Griffiths2004))]
+
+print(paste("The optimum number of topics for the data set is ",topic_num))
+
+#carry out LDA 
+ldaOut <- LDA(
+  dtm,
+  k = topic_num,
+  method = "Gibbs",
+  control = list(
+    nstart = nstart,
+    seed = seed,
+    best = best,
+    burnin = burnin,
+    iter = iter,
+    keep = keep,
+    thin = thin
+  )
+)
+
+#docs to topics
+topics <- as.matrix(topics(ldaOut))
+topics
+table(topics)
+
+
+# topic terms in each topic
+terms <- as.matrix(terms(ldaOut,15))
+terms
+
+
+#corresponding probabilities
+topicProbabilities <- as.data.frame(ldaOut@gamma)
+topicProbabilities
+
+#using the top words for assigning them as labels for the topics 
+colnames(topicProbabilities) <- apply(terms(ldaOut,5),2,paste,collapse=",")
+head(topicProbabilities)
+
+
+#create a wordcloud of the top words
+topic <- 8
+df <- data.frame(term = ldaOut@terms, p = exp(ldaOut@beta[topic,]))
+head(df[order(-df$p),])
+
+#creating the wordclouds
+library(wordcloud)
+wordcloud(words = df$term,
+          freq = df$p,
+          max.words = 200,
+          random.order = FALSE,
+          rot.per = 0.35,
+          colors=brewer.pal(8, "Dark2"))
+
+
